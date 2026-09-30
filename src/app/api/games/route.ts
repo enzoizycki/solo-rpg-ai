@@ -20,6 +20,56 @@ function cleanText(s: string): string {
     .trim();
 }
 
+/**
+ * Procura o Blob correto no armazenamento.
+ *
+ * Primeiro tenta encontrar exatamente o pathname recebido.
+ * Se não encontrar, procura pelo nome original do PDF dentro de uploads/.
+ */
+async function findBlobPathname(
+  requestedPathname: string,
+  originalFileName: string,
+): Promise<string | null> {
+  let cursor: string | undefined = undefined;
+
+  do {
+    const result: Awaited<ReturnType<typeof list>> = await list({
+      prefix: "uploads/",
+      limit: 1000,
+      cursor,
+    });
+
+    const exactMatch = result.blobs.find(
+      (blob) => blob.pathname === requestedPathname,
+    );
+
+    if (exactMatch) {
+      return exactMatch.pathname;
+    }
+
+    const safeOriginalName = originalFileName
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .slice(-150);
+
+    const nameMatch = result.blobs.find(
+      (blob) =>
+        blob.pathname.endsWith(`-${safeOriginalName}`) ||
+        blob.pathname.endsWith(`/${safeOriginalName}`),
+    );
+
+    if (nameMatch) {
+      return nameMatch.pathname;
+    }
+
+    cursor = result.hasMore ? result.cursor : undefined;
+  } while (cursor);
+
+  return null;
+}
+
+/**
+ * Ask the AI to identify which RPG system the rulebook belongs to.
+ */
 async function identifyGame(
   rulesText: string,
   fileNames: string[],
@@ -38,9 +88,13 @@ async function identifyGame(
       json: true,
       temperature: 0.2,
       prompt: `Abaixo está o início de um livro de regras de RPG (arquivos: ${fileNames.join(", ")}).
+
 Identifique o jogo e responda APENAS com JSON:
-{"systemName": "nome do jogo/sistema (ex.: Dungeons & Dragons 5ª Edição, Tormenta20, Ordem Paranormal, Call of Cthulhu 7e...)",
- "systemSummary": "resumo em português de 4 a 8 linhas: gênero/cenário, mecânica central de dados, atributos principais e passos da criação de personagem conforme o livro"}
+
+{
+  "systemName": "nome do jogo/sistema (ex.: Dungeons & Dragons 5ª Edição, Tormenta20, Ordem Paranormal, Call of Cthulhu 7e...)",
+  "systemSummary": "resumo em português de 4 a 8 linhas: gênero/cenário, mecânica central de dados, atributos principais e passos da criação de personagem conforme o livro"
+}
 
 TEXTO:
 """
@@ -64,36 +118,6 @@ ${sample}
   }
 }
 
-async function findRealBlob(pathname: string) {
-  console.log("Looking for Blob:", pathname);
-
-  // First try to find exactly what was uploaded under uploads/.
-  let cursor: string | undefined = undefined;
-
-  do {
-    const result = await list({
-      prefix: "uploads/",
-      limit: 1000,
-      cursor,
-    });
-
-    const exact = result.blobs.find(
-      (blob) => blob.pathname === pathname,
-    );
-
-    if (exact) {
-      console.log("Blob found:", exact.pathname);
-      return exact;
-    }
-
-    cursor = result.hasMore ? result.cursor : undefined;
-  } while (cursor);
-
-  console.error("Blob not found by list():", pathname);
-
-  return null;
-}
-
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -111,14 +135,10 @@ export async function POST(req: Request) {
             const item = file as Record<string, unknown>;
 
             const name =
-              typeof item.name === "string"
-                ? item.name.trim()
-                : "";
+              typeof item.name === "string" ? item.name.trim() : "";
 
             const pathname =
-              typeof item.pathname === "string"
-                ? item.pathname.trim()
-                : "";
+              typeof item.pathname === "string" ? item.pathname.trim() : "";
 
             if (!name || !pathname) {
               return null;
@@ -140,7 +160,9 @@ export async function POST(req: Request) {
         {
           error: "Nenhum PDF enviado foi informado.",
         },
-        { status: 400 },
+        {
+          status: 400,
+        },
       );
     }
 
@@ -165,82 +187,107 @@ export async function POST(req: Request) {
           {
             error: `O arquivo "${name}" não é um PDF.`,
           },
-          { status: 400 },
+          {
+            status: 400,
+          },
         );
       }
 
       /*
-       * IMPORTANT:
-       * Confirm the Blob actually exists in the connected store.
+       * Confere qual pathname realmente existe no Blob Store.
+       *
+       * Isso também evita o problema em que o browser envia um pathname,
+       * mas o arquivo existente no armazenamento possui outro UUID.
        */
-      const blob = await findRealBlob(uploadedFile.pathname);
+      let blobPathname: string | null = null;
 
-      if (!blob) {
+      try {
+        blobPathname = await findBlobPathname(
+          uploadedFile.pathname,
+          uploadedFile.name,
+        );
+      } catch (err) {
+        console.error(`Blob list error for ${name}:`, err);
+
         return Response.json(
           {
-            error:
-              `O PDF "${name}" foi enviado, mas não foi localizado pelo servidor. ` +
-              `Path recebido: ${uploadedFile.pathname}`,
+            error: `Não foi possível consultar o armazenamento para o PDF "${name}". ${
+              err instanceof Error ? err.message : ""
+            }`,
           },
-          { status: 404 },
+          {
+            status: 422,
+          },
         );
       }
+
+      if (!blobPathname) {
+        console.error("Blob not found:", {
+          requestedPathname: uploadedFile.pathname,
+          originalFileName: uploadedFile.name,
+        });
+
+        return Response.json(
+          {
+            error: `O PDF "${name}" não foi encontrado no armazenamento.`,
+          },
+          {
+            status: 404,
+          },
+        );
+      }
+
+      console.log("Blob located:", {
+        requestedPathname: uploadedFile.pathname,
+        resolvedPathname: blobPathname,
+        originalFileName: name,
+      });
 
       let buffer: Uint8Array;
 
       try {
-        console.log("Reading Blob:", blob.pathname);
-
-        const result = await get(blob.pathname, {
+        const blob = await get(blobPathname, {
           access: "private",
           useCache: false,
         });
 
-        if (!result) {
-          console.error(
-            "get() returned null for existing Blob:",
-            blob.pathname,
-          );
-
+        if (!blob) {
           return Response.json(
             {
-              error:
-                `O PDF "${name}" existe no armazenamento, ` +
-                `mas o servidor não conseguiu abrir o conteúdo.`,
+              error: `O PDF "${name}" foi localizado, mas não pôde ser aberto.`,
             },
-            { status: 422 },
+            {
+              status: 404,
+            },
           );
         }
 
-        const arrayBuffer = await new Response(
-          result.stream,
-        ).arrayBuffer();
+        const arrayBuffer = await new Response(blob.stream).arrayBuffer();
 
         buffer = new Uint8Array(arrayBuffer);
-
-        console.log(
-          "Blob downloaded successfully:",
-          blob.pathname,
-          buffer.byteLength,
-          "bytes",
-        );
       } catch (err) {
-        console.error(
-          `Blob read error for ${blob.pathname}:`,
-          err,
-        );
+        console.error(`Blob read error for ${name}:`, err);
 
         return Response.json(
           {
-            error:
-              `Não foi possível carregar o PDF "${name}" do armazenamento. ` +
-              `${
-                err instanceof Error
-                  ? err.message
-                  : "Erro desconhecido."
-              }`,
+            error: `Não foi possível carregar o PDF "${name}" do armazenamento. ${
+              err instanceof Error ? err.message : ""
+            }`,
           },
-          { status: 422 },
+          {
+            status: 422,
+          },
+        );
+      }
+
+      if (buffer.length === 0) {
+        return Response.json(
+          {
+            error: `O PDF "${name}" está vazio.`,
+          },
+          {
+            status: 422,
+          },
         );
       }
 
@@ -254,27 +301,20 @@ export async function POST(req: Request) {
         });
 
         pageTexts = (
-          Array.isArray(result.text)
-            ? result.text
-            : [result.text]
+          Array.isArray(result.text) ? result.text : [result.text]
         ).map(cleanText);
       } catch (err) {
-        console.error(
-          `PDF parse error for ${name}:`,
-          err,
-        );
+        console.error(`PDF parse error for ${name}:`, err);
 
         return Response.json(
           {
-            error:
-              `Não foi possível ler o PDF "${name}". ` +
-              `Ele pode estar protegido por senha ou corrompido. Detalhe: ${
-                err instanceof Error
-                  ? err.message
-                  : "erro desconhecido"
-              }`,
+            error: `Não foi possível ler o PDF "${name}". Ele pode estar protegido por senha, corrompido ou possuir um formato que não pôde ser processado. Detalhe: ${
+              err instanceof Error ? err.message : "erro desconhecido"
+            }`,
           },
-          { status: 422 },
+          {
+            status: 422,
+          },
         );
       }
 
@@ -302,9 +342,7 @@ export async function POST(req: Request) {
           `### Arquivo: ${name}\n` +
             pageTexts
               .map((text, index) =>
-                text
-                  ? `[p.${index + 1}]\n${text}`
-                  : "",
+                text ? `[p.${index + 1}]\n${text}` : "",
               )
               .filter(Boolean)
               .join("\n\n"),
@@ -320,17 +358,18 @@ export async function POST(req: Request) {
           error:
             "Nenhum texto pôde ser extraído dos PDFs enviados. " +
             "Provavelmente eles são digitalizados (imagens). " +
-            "Envie um PDF com texto selecionável.",
+            "Envie um PDF com texto selecionável (ex.: exportado direto do programa, não escaneado).",
         },
-        { status: 422 },
+        {
+          status: 422,
+        },
       );
     }
 
-    const { systemName, systemSummary } =
-      await identifyGame(
-        rulesText,
-        fileMeta.map((file) => file.name),
-      );
+    const { systemName, systemSummary } = await identifyGame(
+      rulesText,
+      fileMeta.map((file) => file.name),
+    );
 
     const [game] = await db
       .insert(games)
@@ -364,12 +403,12 @@ export async function POST(req: Request) {
     return Response.json(
       {
         error: `Erro ao processar os arquivos: ${
-          err instanceof Error
-            ? err.message
-            : "erro desconhecido"
+          err instanceof Error ? err.message : "erro desconhecido"
         }`,
       },
-      { status: 500 },
+      {
+        status: 500,
+      },
     );
   }
 }

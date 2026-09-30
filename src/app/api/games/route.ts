@@ -2,10 +2,16 @@ import { db } from "@/db";
 import { games } from "@/db/schema";
 import { extractText, getDocumentProxy } from "unpdf";
 import { generateGemini, hasGemini } from "@/lib/gemini";
+import { get } from "@vercel/blob";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 120;
+
+type UploadedFile = {
+  name: string;
+  pathname: string;
+};
 
 function cleanText(s: string): string {
   return (s ?? "")
@@ -20,10 +26,15 @@ async function identifyGame(
   fileNames: string[],
 ): Promise<{ systemName: string; systemSummary: string }> {
   if (!hasGemini()) {
-    return { systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "", systemSummary: "" };
+    return {
+      systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemSummary: "",
+    };
   }
+
   try {
     const sample = rulesText.slice(0, 40000);
+
     const raw = await generateGemini({
       json: true,
       temperature: 0.2,
@@ -37,40 +48,53 @@ TEXTO:
 ${sample}
 """`,
     });
+
     const parsed = JSON.parse(raw);
+
     return {
       systemName: String(parsed.systemName ?? "").slice(0, 200),
       systemSummary: String(parsed.systemSummary ?? "").slice(0, 3000),
     };
   } catch (err) {
     console.error("identifyGame failed:", err);
-    return { systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "", systemSummary: "" };
+
+    return {
+      systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemSummary: "",
+    };
   }
 }
 
 export async function POST(req: Request) {
-  let form: FormData;
   try {
-    form = await req.formData();
-  } catch (err) {
-    console.error("formData parse failed:", err);
-    return Response.json(
-      {
-        error:
-          "Não foi possível receber o arquivo. Ele pode ser grande demais. Tente um PDF menor (idealmente até 50 MB).",
-      },
-      { status: 413 },
-    );
-  }
+    const body = await req.json();
 
-  try {
-    const title = (form.get("title") as string) || "Nova Campanha";
-    const masterProfile = (form.get("masterProfile") as string) || "balanced";
-    const files = form.getAll("files").filter((f): f is File => f instanceof File);
+    const title = String(body.title || "Nova Campanha");
+    const masterProfile = String(body.masterProfile || "balanced");
 
-    if (files.length === 0) {
+    const uploadedFiles: UploadedFile[] = Array.isArray(body.files)
+      ? body.files
+          .map((file: unknown) => {
+            if (!file || typeof file !== "object") return null;
+
+            const item = file as Record<string, unknown>;
+
+            const name =
+              typeof item.name === "string" ? item.name.trim() : "";
+
+            const pathname =
+              typeof item.pathname === "string" ? item.pathname.trim() : "";
+
+            if (!name || !pathname) return null;
+
+            return { name, pathname };
+          })
+          .filter((file: UploadedFile | null): file is UploadedFile => file !== null)
+      : [];
+
+    if (uploadedFiles.length === 0) {
       return Response.json(
-        { error: "Envie ao menos um PDF com as regras do jogo." },
+        { error: "Nenhum PDF enviado foi informado." },
         { status: 400 },
       );
     }
@@ -79,25 +103,58 @@ export async function POST(req: Request) {
     const pages: { file: string; page: number; text: string }[] = [];
     const chunks: string[] = [];
 
-    for (const file of files) {
-      const name = file.name || "arquivo.pdf";
-      if (file.size === 0) {
+    for (const uploadedFile of uploadedFiles) {
+      const name = uploadedFile.name;
+
+      if (!name.toLowerCase().endsWith(".pdf")) {
         return Response.json(
-          { error: `O arquivo "${name}" está vazio (0 bytes).` },
+          { error: `O arquivo "${name}" não é um PDF.` },
           { status: 400 },
         );
       }
-      const buffer = new Uint8Array(await file.arrayBuffer());
+
+      let buffer: Uint8Array;
+
+      try {
+        const result = await get(uploadedFile.pathname, {
+          access: "private",
+          useCache: false,
+        });
+
+        if (!result) {
+          return Response.json(
+            { error: `O PDF "${name}" não foi encontrado no armazenamento.` },
+            { status: 404 },
+          );
+        }
+
+        const arrayBuffer = await new Response(result.stream).arrayBuffer();
+        buffer = new Uint8Array(arrayBuffer);
+      } catch (err) {
+        console.error(`Blob read error for ${name}:`, err);
+
+        return Response.json(
+          {
+            error: `Não foi possível carregar o PDF "${name}" do armazenamento. ${
+              err instanceof Error ? err.message : ""
+            }`,
+          },
+          { status: 422 },
+        );
+      }
 
       let pageTexts: string[] = [];
+
       try {
         const pdf = await getDocumentProxy(buffer);
         const result = await extractText(pdf, { mergePages: false });
-        pageTexts = (Array.isArray(result.text) ? result.text : [result.text]).map(
-          cleanText,
-        );
+
+        pageTexts = (
+          Array.isArray(result.text) ? result.text : [result.text]
+        ).map(cleanText);
       } catch (err) {
         console.error(`PDF parse error for ${name}:`, err);
+
         return Response.json(
           {
             error: `Não foi possível ler o PDF "${name}". Ele pode estar protegido por senha ou corrompido. Detalhe: ${
@@ -109,18 +166,31 @@ export async function POST(req: Request) {
       }
 
       let chars = 0;
-      pageTexts.forEach((t, i) => {
-        if (t.length > 0) {
-          pages.push({ file: name, page: i + 1, text: t });
-          chars += t.length;
+
+      pageTexts.forEach((text, index) => {
+        if (text.length > 0) {
+          pages.push({
+            file: name,
+            page: index + 1,
+            text,
+          });
+
+          chars += text.length;
         }
       });
-      fileMeta.push({ name, chars });
+
+      fileMeta.push({
+        name,
+        chars,
+      });
+
       if (chars > 0) {
         chunks.push(
           `### Arquivo: ${name}\n` +
             pageTexts
-              .map((t, i) => (t ? `[p.${i + 1}]\n${t}` : ""))
+              .map((text, index) =>
+                text ? `[p.${index + 1}]\n${text}` : "",
+              )
               .filter(Boolean)
               .join("\n\n"),
         );
@@ -143,13 +213,16 @@ export async function POST(req: Request) {
 
     const { systemName, systemSummary } = await identifyGame(
       rulesText,
-      fileMeta.map((f) => f.name),
+      fileMeta.map((file) => file.name),
     );
 
     const [game] = await db
       .insert(games)
       .values({
-        title: title === "Nova Campanha" && systemName ? systemName : title,
+        title:
+          title === "Nova Campanha" && systemName
+            ? systemName
+            : title,
         masterProfile,
         rulesText,
         pages,
@@ -171,6 +244,7 @@ export async function POST(req: Request) {
     });
   } catch (err) {
     console.error("games POST failed:", err);
+
     return Response.json(
       {
         error: `Erro ao processar os arquivos: ${

@@ -75,83 +75,47 @@ export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    /*
-     * DEBUG TEMPORÁRIO
-     *
-     * Isso vai mostrar nos Logs da Vercel exatamente
-     * o que o navegador está enviando para /api/games.
-     */
-    console.log("======================================");
-    console.log("=== DEBUG API GAMES ===");
-    console.log("BODY RECEBIDO:", JSON.stringify(body, null, 2));
-    console.log("BODY.FILES:", body?.files);
-    console.log("IS ARRAY:", Array.isArray(body?.files));
-    console.log("======================================");
-
     const title = String(body?.title || "Nova Campanha");
+    const masterProfile = String(body?.masterProfile || "balanced");
 
-    const masterProfile = String(
-      body?.masterProfile || "balanced",
-    );
+    const uploadedFiles: UploadedFile[] = Array.isArray(body?.files)
+      ? body.files
+          .map((file: unknown) => {
+            if (!file || typeof file !== "object") {
+              return null;
+            }
 
-    const uploadedFiles: UploadedFile[] =
-      Array.isArray(body?.files)
-        ? body.files
-            .map((file: unknown) => {
-              if (!file || typeof file !== "object") {
-                return null;
-              }
+            const item = file as Record<string, unknown>;
 
-              const item = file as Record<string, unknown>;
+            const name =
+              typeof item.name === "string"
+                ? item.name.trim()
+                : "";
 
-              const name =
-                typeof item.name === "string"
-                  ? item.name.trim()
-                  : "";
+            const pathname =
+              typeof item.pathname === "string"
+                ? item.pathname.trim()
+                : "";
 
-              const pathname =
-                typeof item.pathname === "string"
-                  ? item.pathname.trim()
-                  : "";
+            if (!name || !pathname) {
+              return null;
+            }
 
-              if (!name || !pathname) {
-                console.error(
-                  "Arquivo descartado porque name/pathname está ausente:",
-                  item,
-                );
+            return {
+              name,
+              pathname,
+            };
+          })
+          .filter(
+            (
+              file: UploadedFile | null,
+            ): file is UploadedFile => file !== null,
+          )
+      : [];
 
-                return null;
-              }
-
-              return {
-                name,
-                pathname,
-              };
-            })
-            .filter(
-              (
-                file: UploadedFile | null,
-              ): file is UploadedFile => file !== null,
-            )
-        : [];
-
-    console.log(
-      "ARQUIVOS VÁLIDOS DEPOIS DO PARSE:",
-      uploadedFiles,
-    );
+    console.log("FILES RECEIVED:", uploadedFiles);
 
     if (uploadedFiles.length === 0) {
-      console.error(
-        "Nenhum UploadedFile válido foi encontrado.",
-        {
-          originalFiles: body?.files,
-          bodyKeys:
-            body && typeof body === "object"
-              ? Object.keys(body)
-              : [],
-        },
-      );
-
       return Response.json(
         {
           error: "Nenhum PDF enviado foi informado.",
@@ -159,6 +123,15 @@ export async function POST(req: Request) {
         { status: 400 },
       );
     }
+
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+
+    console.log("BLOB CONFIG:", {
+      hasToken: Boolean(blobToken),
+      storeId: process.env.BLOB_STORE_ID
+        ? "available"
+        : "missing",
+    });
 
     const fileMeta: {
       name: string;
@@ -174,8 +147,7 @@ export async function POST(req: Request) {
     const chunks: string[] = [];
 
     for (const uploadedFile of uploadedFiles) {
-      const name = uploadedFile.name;
-      const pathname = uploadedFile.pathname;
+      const { name, pathname } = uploadedFile;
 
       if (!name.toLowerCase().endsWith(".pdf")) {
         return Response.json(
@@ -186,7 +158,7 @@ export async function POST(req: Request) {
         );
       }
 
-      console.log("Reading Blob:", {
+      console.log("TRYING TO READ BLOB:", {
         name,
         pathname,
       });
@@ -197,10 +169,15 @@ export async function POST(req: Request) {
         const blob = await get(pathname, {
           access: "private",
           useCache: false,
+          ...(blobToken
+            ? {
+                token: blobToken,
+              }
+            : {}),
         });
 
         if (!blob) {
-          console.error("get() returned null:", {
+          console.error("BLOB NOT FOUND:", {
             name,
             pathname,
           });
@@ -208,13 +185,17 @@ export async function POST(req: Request) {
           return Response.json(
             {
               error:
-                `O PDF "${name}" foi enviado, ` +
-                `mas o armazenamento não conseguiu ` +
-                `abri-lo pelo caminho "${pathname}".`,
+                `O PDF "${name}" foi enviado, mas não foi encontrado ` +
+                `no armazenamento pelo caminho "${pathname}".`,
             },
             { status: 404 },
           );
         }
+
+        console.log("BLOB FOUND:", {
+          name,
+          pathname,
+        });
 
         const arrayBuffer = await new Response(
           blob.stream,
@@ -222,13 +203,12 @@ export async function POST(req: Request) {
 
         buffer = new Uint8Array(arrayBuffer);
 
-        console.log("Blob successfully loaded:", {
+        console.log("BLOB DOWNLOADED:", {
           name,
-          pathname,
           bytes: buffer.length,
         });
       } catch (err) {
-        console.error("Blob read error:", {
+        console.error("BLOB READ FAILED:", {
           name,
           pathname,
           error: err,
@@ -237,8 +217,7 @@ export async function POST(req: Request) {
         return Response.json(
           {
             error:
-              `Não foi possível carregar ` +
-              `"${name}" do armazenamento. ` +
+              `Não foi possível abrir o PDF "${name}" no armazenamento. ` +
               `${
                 err instanceof Error
                   ? err.message
@@ -258,9 +237,11 @@ export async function POST(req: Request) {
         );
       }
 
-      let pageTexts: string[] = [];
+      let pageTexts: string[];
 
       try {
+        console.log("STARTING PDF EXTRACTION:", name);
+
         const pdf = await getDocumentProxy(buffer);
 
         const extracted = await extractText(pdf, {
@@ -272,23 +253,26 @@ export async function POST(req: Request) {
             ? extracted.text
             : [extracted.text]
         ).map(cleanText);
+
+        console.log("PDF EXTRACTED:", {
+          name,
+          pages: pageTexts.length,
+        });
       } catch (err) {
-        console.error(
-          `PDF parse error for ${name}:`,
-          err,
-        );
+        console.error("PDF PARSE FAILED:", {
+          name,
+          error: err,
+        });
 
         return Response.json(
           {
             error:
-              `Não foi possível ler o PDF ` +
-              `"${name}". ` +
-              `Ele pode estar protegido por senha, ` +
-              `corrompido ou em um formato incompatível. ` +
-              `Detalhe: ${
+              `O arquivo "${name}" foi encontrado no armazenamento, ` +
+              `mas não foi possível ler o PDF. ` +
+              `${
                 err instanceof Error
                   ? err.message
-                  : "erro desconhecido"
+                  : "Erro desconhecido."
               }`,
           },
           { status: 422 },
@@ -298,15 +282,15 @@ export async function POST(req: Request) {
       let chars = 0;
 
       pageTexts.forEach((text, index) => {
-        if (text.length > 0) {
-          pages.push({
-            file: name,
-            page: index + 1,
-            text,
-          });
+        if (!text) return;
 
-          chars += text.length;
-        }
+        pages.push({
+          file: name,
+          page: index + 1,
+          text,
+        });
+
+        chars += text.length;
       });
 
       fileMeta.push({
@@ -331,31 +315,32 @@ export async function POST(req: Request) {
 
     const rulesText = chunks.join("\n\n");
 
+    console.log("EXTRACTION SUMMARY:", {
+      files: fileMeta,
+      pages: pages.length,
+      characters: rulesText.length,
+    });
+
     if (rulesText.trim().length < 20) {
       return Response.json(
         {
           error:
-            "Nenhum texto pôde ser extraído dos PDFs enviados. " +
-            "Provavelmente eles são digitalizados (imagens). " +
-            "Envie um PDF com texto selecionável.",
+            "O PDF foi carregado corretamente, mas nenhum texto pôde ser extraído. " +
+            "Provavelmente ele contém apenas páginas digitalizadas como imagens.",
         },
         { status: 422 },
       );
     }
 
-    console.log("PDF extraction complete:", {
-      files: fileMeta.length,
-      pages: pages.length,
-      characters: rulesText.length,
-    });
+    const { systemName, systemSummary } =
+      await identifyGame(
+        rulesText,
+        fileMeta.map((file) => file.name),
+      );
 
-    const {
+    console.log("GAME IDENTIFIED:", {
       systemName,
-      systemSummary,
-    } = await identifyGame(
-      rulesText,
-      fileMeta.map((file) => file.name),
-    );
+    });
 
     const [game] = await db
       .insert(games)
@@ -364,7 +349,6 @@ export async function POST(req: Request) {
           title === "Nova Campanha" && systemName
             ? systemName
             : title,
-
         masterProfile,
         rulesText,
         pages,
@@ -377,8 +361,6 @@ export async function POST(req: Request) {
     console.log("GAME CREATED:", {
       id: game.id,
       systemName: game.systemName,
-      pages: pages.length,
-      rulesChars: rulesText.length,
     });
 
     return Response.json({
@@ -392,7 +374,7 @@ export async function POST(req: Request) {
       systemSummary: game.systemSummary,
     });
   } catch (err) {
-    console.error("games POST failed:", err);
+    console.error("GAMES POST FAILED:", err);
 
     return Response.json(
       {

@@ -1,80 +1,430 @@
-import { issueSignedToken, presignUrl } from "@vercel/blob";
+import { db } from "@/db";
+import { games } from "@/db/schema";
+import { extractText, getDocumentProxy } from "unpdf";
+import { generateGemini, hasGemini } from "@/lib/gemini";
+import { get } from "@vercel/blob";
 
-export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 120;
+
+type UploadedFile = {
+  name: string;
+  pathname: string;
+};
+
+function cleanText(s: string): string {
+  return (s ?? "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function identifyGame(
+  rulesText: string,
+  fileNames: string[],
+): Promise<{
+  systemName: string;
+  systemSummary: string;
+}> {
+  if (!hasGemini()) {
+    return {
+      systemName:
+        fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemSummary: "",
+    };
+  }
+
+  try {
+    const sample = rulesText.slice(0, 40000);
+
+    const raw = await generateGemini({
+      json: true,
+      temperature: 0.2,
+      prompt: `Abaixo está o início de um livro de regras de RPG (arquivos: ${fileNames.join(", ")}).
+
+Identifique o jogo e responda APENAS com JSON:
+
+{
+  "systemName": "nome do jogo/sistema",
+  "systemSummary": "resumo em português de 4 a 8 linhas: gênero/cenário, mecânica central de dados, atributos principais e passos da criação de personagem conforme o livro"
+}
+
+TEXTO:
+"""
+${sample}
+"""`,
+    });
+
+    const parsed = JSON.parse(raw);
+
+    return {
+      systemName: String(
+        parsed.systemName ?? "",
+      ).slice(0, 200),
+
+      systemSummary: String(
+        parsed.systemSummary ?? "",
+      ).slice(0, 3000),
+    };
+  } catch (err) {
+    console.error("identifyGame failed:", err);
+
+    return {
+      systemName:
+        fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemSummary: "",
+    };
+  }
+}
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    const fileName = String(body.fileName ?? "").trim();
-    const contentType = String(
-      body.contentType ?? "application/pdf",
-    ).trim();
+    const title = String(
+      body.title || "Nova Campanha",
+    );
 
-    if (!fileName) {
+    const masterProfile = String(
+      body.masterProfile || "balanced",
+    );
+
+    const uploadedFiles: UploadedFile[] =
+      Array.isArray(body.files)
+        ? body.files
+            .map((file: unknown) => {
+              if (
+                !file ||
+                typeof file !== "object"
+              ) {
+                return null;
+              }
+
+              const item =
+                file as Record<string, unknown>;
+
+              const name =
+                typeof item.name === "string"
+                  ? item.name.trim()
+                  : "";
+
+              const pathname =
+                typeof item.pathname === "string"
+                  ? item.pathname.trim()
+                  : "";
+
+              if (!name || !pathname) {
+                return null;
+              }
+
+              return {
+                name,
+                pathname,
+              };
+            })
+            .filter(
+              (
+                file: UploadedFile | null,
+              ): file is UploadedFile =>
+                file !== null,
+            )
+        : [];
+
+    if (uploadedFiles.length === 0) {
       return Response.json(
-        { error: "Nome do arquivo não informado." },
+        {
+          error:
+            "Nenhum PDF enviado foi informado.",
+        },
         { status: 400 },
       );
     }
 
-    if (!fileName.toLowerCase().endsWith(".pdf")) {
-      return Response.json(
-        { error: "Apenas arquivos PDF são permitidos." },
-        { status: 400 },
+    console.log(
+      "Files received by /api/games:",
+      uploadedFiles,
+    );
+
+    const fileMeta: {
+      name: string;
+      chars: number;
+    }[] = [];
+
+    const pages: {
+      file: string;
+      page: number;
+      text: string;
+    }[] = [];
+
+    const chunks: string[] = [];
+
+    for (const uploadedFile of uploadedFiles) {
+      const name = uploadedFile.name;
+      const pathname = uploadedFile.pathname;
+
+      if (
+        !name.toLowerCase().endsWith(".pdf")
+      ) {
+        return Response.json(
+          {
+            error: `O arquivo "${name}" não é um PDF.`,
+          },
+          { status: 400 },
+        );
+      }
+
+      console.log("Reading Blob:", {
+        name,
+        pathname,
+      });
+
+      let buffer: Uint8Array;
+
+      try {
+        /*
+         * IMPORTANTE:
+         *
+         * Não procuramos mais o PDF com list().
+         * Usamos exatamente o pathname criado
+         * pelo /api/upload.
+         */
+        const blob = await get(pathname, {
+          access: "private",
+          useCache: false,
+        });
+
+        if (!blob) {
+          console.error(
+            "get() returned null:",
+            {
+              name,
+              pathname,
+            },
+          );
+
+          return Response.json(
+            {
+              error:
+                `O PDF "${name}" foi enviado, ` +
+                `mas o armazenamento não conseguiu ` +
+                `abri-lo pelo caminho "${pathname}".`,
+            },
+            { status: 404 },
+          );
+        }
+
+        const arrayBuffer =
+          await new Response(
+            blob.stream,
+          ).arrayBuffer();
+
+        buffer =
+          new Uint8Array(arrayBuffer);
+
+        console.log(
+          "Blob successfully loaded:",
+          {
+            name,
+            pathname,
+            bytes: buffer.length,
+          },
+        );
+      } catch (err) {
+        console.error(
+          "Blob read error:",
+          {
+            name,
+            pathname,
+            error: err,
+          },
+        );
+
+        return Response.json(
+          {
+            error:
+              `Não foi possível carregar ` +
+              `"${name}" do armazenamento. ` +
+              `${
+                err instanceof Error
+                  ? err.message
+                  : "Erro desconhecido."
+              }`,
+          },
+          { status: 422 },
+        );
+      }
+
+      if (buffer.length === 0) {
+        return Response.json(
+          {
+            error:
+              `O PDF "${name}" está vazio.`,
+          },
+          { status: 422 },
+        );
+      }
+
+      let pageTexts: string[] = [];
+
+      try {
+        const pdf =
+          await getDocumentProxy(buffer);
+
+        const extracted =
+          await extractText(pdf, {
+            mergePages: false,
+          });
+
+        pageTexts = (
+          Array.isArray(extracted.text)
+            ? extracted.text
+            : [extracted.text]
+        ).map(cleanText);
+      } catch (err) {
+        console.error(
+          `PDF parse error for ${name}:`,
+          err,
+        );
+
+        return Response.json(
+          {
+            error:
+              `Não foi possível ler o PDF ` +
+              `"${name}". ` +
+              `Ele pode estar protegido por senha, ` +
+              `corrompido ou em um formato incompatível. ` +
+              `Detalhe: ${
+                err instanceof Error
+                  ? err.message
+                  : "erro desconhecido"
+              }`,
+          },
+          { status: 422 },
+        );
+      }
+
+      let chars = 0;
+
+      pageTexts.forEach(
+        (text, index) => {
+          if (text.length > 0) {
+            pages.push({
+              file: name,
+              page: index + 1,
+              text,
+            });
+
+            chars += text.length;
+          }
+        },
       );
+
+      fileMeta.push({
+        name,
+        chars,
+      });
+
+      if (chars > 0) {
+        chunks.push(
+          `### Arquivo: ${name}\n` +
+            pageTexts
+              .map(
+                (text, index) =>
+                  text
+                    ? `[p.${index + 1}]\n${text}`
+                    : "",
+              )
+              .filter(Boolean)
+              .join("\n\n"),
+        );
+      }
     }
+
+    const rulesText =
+      chunks.join("\n\n");
 
     if (
-      contentType &&
-      contentType !== "application/pdf" &&
-      contentType !== "application/octet-stream"
+      rulesText.trim().length < 20
     ) {
       return Response.json(
-        { error: "O arquivo precisa ser um PDF." },
-        { status: 400 },
+        {
+          error:
+            "Nenhum texto pôde ser extraído dos PDFs enviados. " +
+            "Provavelmente eles são digitalizados (imagens). " +
+            "Envie um PDF com texto selecionável.",
+        },
+        { status: 422 },
       );
     }
 
-    const safeName = fileName
-      .replace(/[^a-zA-Z0-9._-]/g, "_")
-      .slice(-150);
+    console.log(
+      "PDF extraction complete:",
+      {
+        files: fileMeta.length,
+        pages: pages.length,
+        characters:
+          rulesText.length,
+      },
+    );
 
-    const pathname = `uploads/${crypto.randomUUID()}-${safeName}`;
+    const {
+      systemName,
+      systemSummary,
+    } = await identifyGame(
+      rulesText,
+      fileMeta.map(
+        (file) => file.name,
+      ),
+    );
 
-    const validUntil = Date.now() + 15 * 60 * 1000;
+    const [game] = await db
+      .insert(games)
+      .values({
+        title:
+          title === "Nova Campanha" &&
+          systemName
+            ? systemName
+            : title,
 
-    const token = await issueSignedToken({
-      operations: ["put"],
-    });
-
-    const { presignedUrl } = await presignUrl(token, {
-      pathname,
-      operation: "put",
-      access: "private",
-      validUntil,
-    });
-
-    console.log("Prepared Blob upload:", {
-      originalName: fileName,
-      pathname,
-    });
+        masterProfile,
+        rulesText,
+        pages,
+        files: fileMeta,
+        systemName,
+        systemSummary,
+      })
+      .returning();
 
     return Response.json({
-      name: fileName,
-      pathname,
-      uploadUrl: presignedUrl,
+      id: game.id,
+      title: game.title,
+      masterProfile:
+        game.masterProfile,
+      files: game.files,
+      rulesChars:
+        rulesText.length,
+      pageCount:
+        pages.length,
+      systemName:
+        game.systemName,
+      systemSummary:
+        game.systemSummary,
     });
   } catch (err) {
-    console.error("Blob upload authorization failed:", err);
+    console.error(
+      "games POST failed:",
+      err,
+    );
 
     return Response.json(
       {
         error:
-          err instanceof Error
-            ? err.message
-            : "Não foi possível preparar o upload.",
+          `Erro ao processar os arquivos: ${
+            err instanceof Error
+              ? err.message
+              : "erro desconhecido"
+          }`,
       },
       { status: 500 },
     );

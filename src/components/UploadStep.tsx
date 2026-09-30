@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { upload } from "@vercel/blob/client";
 import { MASTER_PROFILES } from "@/lib/profiles";
 import type { GameInfo } from "@/lib/types";
 
@@ -20,6 +21,7 @@ export default function UploadStep({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -34,11 +36,13 @@ export default function UploadStep({
         file.type === "application/pdf",
     );
 
-    const rejected = all.filter((file) => !pdfs.includes(file));
+    const rejected = all.filter(
+      (file) => !pdfs.includes(file),
+    );
 
     if (rejected.length > 0) {
       setError(
-        `Ignorado(s) (não são PDF): ${rejected
+        `Ignorado(s) porque não são PDF: ${rejected
           .map((file) => file.name)
           .join(", ")}`,
       );
@@ -63,127 +67,36 @@ export default function UploadStep({
   async function uploadFile(
     file: File,
   ): Promise<UploadedFile> {
-    /*
-     * 1. Pede ao nosso servidor uma URL assinada
-     * para fazer o upload diretamente ao Vercel Blob.
-     */
-    const authRes = await fetch("/api/upload", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        fileName: file.name,
-        contentType:
-          file.type || "application/pdf",
-      }),
+    console.log("Starting official Blob client upload:", {
+      name: file.name,
+      size: file.size,
+      type: file.type,
     });
 
-    const authRaw = await authRes.text();
-
-    let authJson: {
-      pathname?: string;
-      uploadUrl?: string;
-      error?: string;
-    } | null = null;
-
-    try {
-      authJson = authRaw
-        ? JSON.parse(authRaw)
-        : null;
-    } catch {
-      authJson = null;
-    }
-
-    if (
-      !authRes.ok ||
-      !authJson?.uploadUrl ||
-      !authJson.pathname
-    ) {
-      throw new Error(
-        authJson?.error ||
-          `Não foi possível preparar o upload de "${file.name}".`,
-      );
-    }
-
-    /*
-     * 2. Envia o PDF diretamente para o Blob.
-     */
-    const uploadRes = await fetch(
-      authJson.uploadUrl,
+    const blob = await upload(
+      file.name,
+      file,
       {
-        method: "PUT",
-        headers: {
-          "Content-Type":
-            file.type || "application/pdf",
+        access: "private",
+        handleUploadUrl: "/api/upload",
+
+        onUploadProgress(event) {
+          setProgress(Math.round(event.percentage));
         },
-        body: file,
       },
     );
 
-    if (!uploadRes.ok) {
-      let detail = "";
+    console.log("Blob client upload completed:", blob);
 
-      try {
-        detail = await uploadRes.text();
-      } catch {
-        detail = "";
-      }
-
-      console.error(
-        "Blob upload failed:",
-        uploadRes.status,
-        detail,
-      );
-
+    if (!blob.pathname) {
       throw new Error(
-        `Não foi possível enviar "${file.name}" para o armazenamento.`,
-      );
-    }
-
-    /*
-     * 3. Tenta obter do próprio Blob o pathname
-     * efetivamente utilizado.
-     *
-     * Caso a resposta não tenha JSON/pathname,
-     * usamos o pathname que foi assinado pelo
-     * nosso /api/upload.
-     */
-    let uploadedPathname = authJson.pathname;
-
-    try {
-      const uploadRaw = await uploadRes.text();
-
-      if (uploadRaw) {
-        const uploadJson = JSON.parse(
-          uploadRaw,
-        ) as {
-          pathname?: unknown;
-        };
-
-        if (
-          typeof uploadJson.pathname ===
-            "string" &&
-          uploadJson.pathname.trim()
-        ) {
-          uploadedPathname =
-            uploadJson.pathname.trim();
-        }
-      }
-    } catch {
-      // A resposta do Blob pode não conter JSON.
-      // Nesse caso usamos o pathname assinado.
-    }
-
-    if (!uploadedPathname) {
-      throw new Error(
-        `O upload de "${file.name}" terminou, mas o caminho do arquivo não foi retornado.`,
+        `O armazenamento não retornou o caminho de "${file.name}".`,
       );
     }
 
     return {
       name: file.name,
-      pathname: uploadedPathname,
+      pathname: blob.pathname,
     };
   }
 
@@ -197,49 +110,41 @@ export default function UploadStep({
 
     setError("");
     setLoading(true);
+    setProgress(0);
 
     try {
-      const uploadedFiles: UploadedFile[] =
-        [];
+      const uploadedFiles: UploadedFile[] = [];
 
-      /*
-       * Fazemos um upload de cada PDF.
-       */
       for (const file of files) {
-        const uploaded =
-          await uploadFile(file);
+        const uploaded = await uploadFile(file);
 
         uploadedFiles.push(uploaded);
       }
 
-      /*
-       * Agora enviamos apenas os caminhos dos
-       * PDFs armazenados para /api/games.
-       *
-       * Assim o PDF grande NÃO passa novamente
-       * pelo limite normal da Serverless Function.
-       */
-      const res = await fetch("/api/games", {
+      console.log(
+        "FILES CONFIRMED BY BLOB:",
+        uploadedFiles,
+      );
+
+      const response = await fetch("/api/games", {
         method: "POST",
+
         headers: {
-          "Content-Type":
-            "application/json",
+          "Content-Type": "application/json",
         },
+
         body: JSON.stringify({
-          title:
-            title.trim() ||
-            "Nova Campanha",
+          title: title || "Nova Campanha",
           masterProfile: profile,
           files: uploadedFiles,
         }),
       });
 
-      const raw = await res.text();
+      const raw = await response.text();
 
       let json:
         | (GameInfo & {
             error?: string;
-            warnings?: string[];
           })
         | null = null;
 
@@ -251,27 +156,25 @@ export default function UploadStep({
         json = null;
       }
 
-      if (!res.ok || !json) {
+      if (!response.ok || !json) {
         throw new Error(
           json?.error ||
-            `Erro ao processar o livro (HTTP ${res.status}). Tente novamente.`,
+            `Erro ao processar o livro (HTTP ${response.status}).`,
         );
       }
 
       onCreated(json as GameInfo);
     } catch (err) {
-      console.error(
-        "Upload/process error:",
-        err,
-      );
+      console.error("UPLOAD/PROCESSING FAILED:", err);
 
       setError(
         err instanceof Error
           ? err.message
-          : "Erro inesperado ao enviar. Verifique o arquivo e tente novamente.",
+          : "Erro inesperado ao enviar o PDF.",
       );
     } finally {
       setLoading(false);
+      setProgress(0);
     }
   }
 
@@ -287,10 +190,9 @@ export default function UploadStep({
         </h1>
 
         <p className="mt-2 text-[var(--muted)]">
-          Comece enviando o(s) PDF(s) com
-          as regras do seu jogo. O Mestre IA
-          vai estudá-las, montar sua ficha
-          com você no chat e conduzir a
+          Comece enviando o(s) PDF(s) com as regras do
+          seu jogo. O Mestre IA vai estudá-las, montar
+          sua ficha com você no chat e conduzir a
           aventura.
         </p>
       </div>
@@ -324,10 +226,7 @@ export default function UploadStep({
           onDrop={(event) => {
             event.preventDefault();
             setDragging(false);
-
-            addFiles(
-              event.dataTransfer.files,
-            );
+            addFiles(event.dataTransfer.files);
           }}
           onClick={() =>
             inputRef.current?.click()
@@ -343,21 +242,19 @@ export default function UploadStep({
           </div>
 
           <p className="text-[var(--text)] font-medium">
-            Arraste seus PDFs aqui ou clique
-            para selecionar
+            Arraste seus PDFs aqui ou clique para
+            selecionar
           </p>
 
           <p className="text-xs text-[var(--muted)] mt-1">
-            Você pode enviar vários arquivos
-            (livro do jogador,
-            suplementos...)
+            Você pode enviar vários arquivos (livro do
+            jogador, suplementos...)
           </p>
 
           <p className="text-[11px] text-[var(--muted)]/70 mt-2">
-            ⚠️ O PDF precisa ter texto
-            selecionável. PDFs digitalizados
-            (imagens escaneadas) não podem ser
-            lidos pelo Mestre.
+            ⚠️ O PDF precisa ter texto selecionável.
+            PDFs digitalizados (imagens escaneadas) não
+            podem ser lidos pelo Mestre.
           </p>
 
           <input
@@ -366,18 +263,9 @@ export default function UploadStep({
             accept="application/pdf,.pdf"
             multiple
             className="hidden"
-            onChange={(event) => {
-              addFiles(
-                event.target.files,
-              );
-
-              /*
-               * Permite selecionar novamente
-               * o mesmo arquivo depois de
-               * removê-lo da lista.
-               */
-              event.target.value = "";
-            }}
+            onChange={(event) =>
+              addFiles(event.target.files)
+            }
           />
         </div>
 
@@ -411,17 +299,15 @@ export default function UploadStep({
                   onClick={(event) => {
                     event.stopPropagation();
 
-                    setFiles(
-                      (previous) =>
-                        previous.filter(
-                          (item) =>
-                            item.name !==
-                            file.name,
-                        ),
+                    setFiles((previous) =>
+                      previous.filter(
+                        (item) =>
+                          item.name !== file.name,
+                      ),
                     );
                   }}
                   className="text-[var(--muted)] hover:text-red-400 transition px-2"
-                  aria-label={`Remover ${file.name}`}
+                  aria-label="Remover"
                 >
                   ✕
                 </button>
@@ -435,40 +321,51 @@ export default function UploadStep({
         </label>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {MASTER_PROFILES.map(
-            (masterProfile) => (
-              <button
-                type="button"
-                key={masterProfile.id}
-                onClick={() =>
-                  setProfile(
-                    masterProfile.id,
-                  )
-                }
-                className={`text-left rounded-xl border p-3 transition ${
-                  profile ===
-                  masterProfile.id
-                    ? "border-[var(--gold)] bg-[var(--gold)]/10 shadow"
-                    : "border-[var(--border)] bg-[var(--bg-soft)]/50 hover:border-[var(--purple)]/60"
-                }`}
-              >
-                <div className="text-xl">
-                  {masterProfile.emoji}
-                </div>
+          {MASTER_PROFILES.map((item) => (
+            <button
+              type="button"
+              key={item.id}
+              onClick={() =>
+                setProfile(item.id)
+              }
+              className={`text-left rounded-xl border p-3 transition ${
+                profile === item.id
+                  ? "border-[var(--gold)] bg-[var(--gold)]/10 shadow"
+                  : "border-[var(--border)] bg-[var(--bg-soft)]/50 hover:border-[var(--purple)]/60"
+              }`}
+            >
+              <div className="text-xl">
+                {item.emoji}
+              </div>
 
-                <div className="font-semibold text-sm mt-1">
-                  {masterProfile.name}
-                </div>
+              <div className="font-semibold text-sm mt-1">
+                {item.name}
+              </div>
 
-                <div className="text-xs text-[var(--muted)] leading-tight mt-0.5">
-                  {
-                    masterProfile.tagline
-                  }
-                </div>
-              </button>
-            ),
-          )}
+              <div className="text-xs text-[var(--muted)] leading-tight mt-0.5">
+                {item.tagline}
+              </div>
+            </button>
+          ))}
         </div>
+
+        {loading && progress > 0 && (
+          <div className="mt-4">
+            <div className="flex justify-between text-xs text-[var(--muted)] mb-1">
+              <span>Enviando PDF...</span>
+              <span>{progress}%</span>
+            </div>
+
+            <div className="h-2 rounded-full bg-[var(--bg-soft)] overflow-hidden">
+              <div
+                className="h-full bg-[var(--gold)] transition-all"
+                style={{
+                  width: `${progress}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
 
         {error && (
           <p className="mt-4 text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
@@ -483,7 +380,9 @@ export default function UploadStep({
           className="mt-6 w-full rounded-xl bg-gradient-to-r from-[var(--gold)] to-[var(--gold-soft)] text-[#2a1e08] font-semibold py-3 shadow-lg hover:brightness-105 transition disabled:opacity-60 disabled:cursor-not-allowed"
         >
           {loading
-            ? "Enviando e estudando o livro..."
+            ? progress > 0 && progress < 100
+              ? `Enviando PDF... ${progress}%`
+              : "Estudando o livro..."
             : "Enviar livro e montar minha ficha ⟶"}
         </button>
       </div>

@@ -13,25 +13,15 @@ export async function POST(req: Request) {
         : "";
 
     if (!fileName) {
-      console.error("UPLOAD ERROR: fileName não recebido", body);
-
       return Response.json(
-        {
-          error: "O nome do arquivo não foi recebido.",
-        },
+        { error: "O nome do arquivo não foi recebido." },
         { status: 400 },
       );
     }
 
     if (!fileName.toLowerCase().endsWith(".pdf")) {
-      console.error("UPLOAD ERROR: arquivo não é PDF", {
-        fileName,
-      });
-
       return Response.json(
-        {
-          error: "Apenas arquivos PDF são permitidos.",
-        },
+        { error: "Apenas arquivos PDF são permitidos." },
         { status: 400 },
       );
     }
@@ -45,32 +35,35 @@ export async function POST(req: Request) {
     const pathname =
       `uploads/${crypto.randomUUID()}-${safeName}`;
 
-    console.log("Preparing Blob upload:", {
-      originalName: fileName,
-      safeName,
+    console.log("Preparing signed Blob upload:", {
+      fileName,
       pathname,
     });
 
+    // IMPORTANTE:
+    // o token fica explicitamente limitado a ESTE pathname.
     const token = await issueSignedToken({
+      pathname,
       operations: ["put"],
+      validUntil: Date.now() + 15 * 60 * 1000,
     });
 
-    const result = await presignUrl(token, {
+    const { presignedUrl } = await presignUrl(token, {
       pathname,
       operation: "put",
       access: "private",
       validUntil: Date.now() + 15 * 60 * 1000,
     });
 
-    console.log("Blob upload prepared:", {
+    console.log("Signed Blob upload ready:", {
       fileName,
       pathname,
-      hasPresignedUrl: Boolean(result.presignedUrl),
+      hasPresignedUrl: Boolean(presignedUrl),
     });
 
     return Response.json({
       pathname,
-      uploadUrl: result.presignedUrl,
+      uploadUrl: presignedUrl,
     });
   } catch (err) {
     console.error("UPLOAD ROUTE FAILED:", err);

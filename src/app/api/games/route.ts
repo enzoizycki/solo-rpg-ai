@@ -1,7 +1,10 @@
 import { db } from "@/db";
 import { games } from "@/db/schema";
 import { extractText, getDocumentProxy } from "unpdf";
-import { generateGemini, hasGemini } from "@/lib/gemini";
+import {
+  generateGemini,
+  hasGemini,
+} from "@/lib/gemini";
 import { get } from "@vercel/blob";
 
 export const dynamic = "force-dynamic";
@@ -29,7 +32,9 @@ async function identifyGame(
 }> {
   if (!hasGemini()) {
     return {
-      systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemName:
+        fileNames[0]?.replace(/\.pdf$/i, "") ??
+        "",
       systemSummary: "",
     };
   }
@@ -40,7 +45,9 @@ async function identifyGame(
     const raw = await generateGemini({
       json: true,
       temperature: 0.2,
-      prompt: `Abaixo está o início de um livro de regras de RPG (arquivos: ${fileNames.join(", ")}).
+      prompt: `Abaixo está o início de um livro de regras de RPG (arquivos: ${fileNames.join(
+        ", ",
+      )}).
 
 Identifique o jogo e responda APENAS com JSON:
 
@@ -58,14 +65,21 @@ ${sample}
     const parsed = JSON.parse(raw);
 
     return {
-      systemName: String(parsed.systemName ?? "").slice(0, 200),
-      systemSummary: String(parsed.systemSummary ?? "").slice(0, 3000),
+      systemName: String(
+        parsed.systemName ?? "",
+      ).slice(0, 200),
+
+      systemSummary: String(
+        parsed.systemSummary ?? "",
+      ).slice(0, 3000),
     };
   } catch (err) {
     console.error("identifyGame failed:", err);
 
     return {
-      systemName: fileNames[0]?.replace(/\.pdf$/i, "") ?? "",
+      systemName:
+        fileNames[0]?.replace(/\.pdf$/i, "") ??
+        "",
       systemSummary: "",
     };
   }
@@ -75,63 +89,69 @@ export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    const title = String(body?.title || "Nova Campanha");
-    const masterProfile = String(body?.masterProfile || "balanced");
+    const title = String(
+      body.title || "Nova Campanha",
+    );
 
-    const uploadedFiles: UploadedFile[] = Array.isArray(body?.files)
-      ? body.files
-          .map((file: unknown) => {
-            if (!file || typeof file !== "object") {
-              return null;
-            }
+    const masterProfile = String(
+      body.masterProfile || "balanced",
+    );
 
-            const item = file as Record<string, unknown>;
+    const uploadedFiles: UploadedFile[] =
+      Array.isArray(body.files)
+        ? body.files
+            .map((file: unknown) => {
+              if (
+                !file ||
+                typeof file !== "object"
+              ) {
+                return null;
+              }
 
-            const name =
-              typeof item.name === "string"
-                ? item.name.trim()
-                : "";
+              const item =
+                file as Record<string, unknown>;
 
-            const pathname =
-              typeof item.pathname === "string"
-                ? item.pathname.trim()
-                : "";
+              const name =
+                typeof item.name === "string"
+                  ? item.name.trim()
+                  : "";
 
-            if (!name || !pathname) {
-              return null;
-            }
+              const pathname =
+                typeof item.pathname === "string"
+                  ? item.pathname.trim()
+                  : "";
 
-            return {
-              name,
-              pathname,
-            };
-          })
-          .filter(
-            (
-              file: UploadedFile | null,
-            ): file is UploadedFile => file !== null,
-          )
-      : [];
+              if (!name || !pathname) {
+                return null;
+              }
 
-    console.log("FILES RECEIVED:", uploadedFiles);
+              return {
+                name,
+                pathname,
+              };
+            })
+            .filter(
+              (
+                file: UploadedFile | null,
+              ): file is UploadedFile =>
+                file !== null,
+            )
+        : [];
 
     if (uploadedFiles.length === 0) {
       return Response.json(
         {
-          error: "Nenhum PDF enviado foi informado.",
+          error:
+            "Nenhum PDF enviado foi informado.",
         },
         { status: 400 },
       );
     }
 
-    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
-
-    console.log("BLOB CONFIG:", {
-      hasToken: Boolean(blobToken),
-      storeId: process.env.BLOB_STORE_ID
-        ? "available"
-        : "missing",
-    });
+    console.log(
+      "Files received by /api/games:",
+      uploadedFiles,
+    );
 
     const fileMeta: {
       name: string;
@@ -147,7 +167,8 @@ export async function POST(req: Request) {
     const chunks: string[] = [];
 
     for (const uploadedFile of uploadedFiles) {
-      const { name, pathname } = uploadedFile;
+      const name = uploadedFile.name;
+      const pathname = uploadedFile.pathname;
 
       if (!name.toLowerCase().endsWith(".pdf")) {
         return Response.json(
@@ -158,7 +179,7 @@ export async function POST(req: Request) {
         );
       }
 
-      console.log("TRYING TO READ BLOB:", {
+      console.log("Reading Blob:", {
         name,
         pathname,
       });
@@ -169,55 +190,58 @@ export async function POST(req: Request) {
         const blob = await get(pathname, {
           access: "private",
           useCache: false,
-          ...(blobToken
-            ? {
-                token: blobToken,
-              }
-            : {}),
         });
 
         if (!blob) {
-          console.error("BLOB NOT FOUND:", {
-            name,
-            pathname,
-          });
+          console.error(
+            "get() returned null:",
+            {
+              name,
+              pathname,
+            },
+          );
 
           return Response.json(
             {
               error:
-                `O PDF "${name}" foi enviado, mas não foi encontrado ` +
-                `no armazenamento pelo caminho "${pathname}".`,
+                `O PDF "${name}" foi enviado, ` +
+                `mas o armazenamento não conseguiu ` +
+                `abri-lo pelo caminho "${pathname}".`,
             },
             { status: 404 },
           );
         }
 
-        console.log("BLOB FOUND:", {
-          name,
-          pathname,
-        });
-
-        const arrayBuffer = await new Response(
-          blob.stream,
-        ).arrayBuffer();
+        const arrayBuffer =
+          await new Response(
+            blob.stream,
+          ).arrayBuffer();
 
         buffer = new Uint8Array(arrayBuffer);
 
-        console.log("BLOB DOWNLOADED:", {
-          name,
-          bytes: buffer.length,
-        });
+        console.log(
+          "Blob successfully loaded:",
+          {
+            name,
+            pathname,
+            bytes: buffer.length,
+          },
+        );
       } catch (err) {
-        console.error("BLOB READ FAILED:", {
+        console.error("Blob read error:", {
           name,
           pathname,
-          error: err,
+          error:
+            err instanceof Error
+              ? err.message
+              : String(err),
         });
 
         return Response.json(
           {
             error:
-              `Não foi possível abrir o PDF "${name}" no armazenamento. ` +
+              `Não foi possível carregar ` +
+              `"${name}" do armazenamento. ` +
               `${
                 err instanceof Error
                   ? err.message
@@ -237,42 +261,41 @@ export async function POST(req: Request) {
         );
       }
 
-      let pageTexts: string[];
+      let pageTexts: string[] = [];
 
       try {
-        console.log("STARTING PDF EXTRACTION:", name);
+        const pdf =
+          await getDocumentProxy(buffer);
 
-        const pdf = await getDocumentProxy(buffer);
-
-        const extracted = await extractText(pdf, {
-          mergePages: false,
-        });
+        const extracted =
+          await extractText(pdf, {
+            mergePages: false,
+          });
 
         pageTexts = (
           Array.isArray(extracted.text)
             ? extracted.text
             : [extracted.text]
         ).map(cleanText);
-
-        console.log("PDF EXTRACTED:", {
-          name,
-          pages: pageTexts.length,
-        });
       } catch (err) {
-        console.error("PDF PARSE FAILED:", {
-          name,
-          error: err,
-        });
+        console.error(
+          `PDF parse error for ${name}:`,
+          err instanceof Error
+            ? err.message
+            : String(err),
+        );
 
         return Response.json(
           {
             error:
-              `O arquivo "${name}" foi encontrado no armazenamento, ` +
-              `mas não foi possível ler o PDF. ` +
-              `${
+              `Não foi possível ler o PDF ` +
+              `"${name}". ` +
+              `Ele pode estar protegido por senha, ` +
+              `corrompido ou em um formato incompatível. ` +
+              `Detalhe: ${
                 err instanceof Error
                   ? err.message
-                  : "Erro desconhecido."
+                  : "erro desconhecido"
               }`,
           },
           { status: 422 },
@@ -282,15 +305,15 @@ export async function POST(req: Request) {
       let chars = 0;
 
       pageTexts.forEach((text, index) => {
-        if (!text) return;
+        if (text.length > 0) {
+          pages.push({
+            file: name,
+            page: index + 1,
+            text,
+          });
 
-        pages.push({
-          file: name,
-          page: index + 1,
-          text,
-        });
-
-        chars += text.length;
+          chars += text.length;
+        }
       });
 
       fileMeta.push({
@@ -315,40 +338,54 @@ export async function POST(req: Request) {
 
     const rulesText = chunks.join("\n\n");
 
-    console.log("EXTRACTION SUMMARY:", {
-      files: fileMeta,
-      pages: pages.length,
-      characters: rulesText.length,
-    });
-
     if (rulesText.trim().length < 20) {
       return Response.json(
         {
           error:
-            "O PDF foi carregado corretamente, mas nenhum texto pôde ser extraído. " +
-            "Provavelmente ele contém apenas páginas digitalizadas como imagens.",
+            "Nenhum texto pôde ser extraído dos PDFs enviados. " +
+            "Provavelmente eles são digitalizados (imagens). " +
+            "Envie um PDF com texto selecionável.",
         },
         { status: 422 },
       );
     }
 
-    const { systemName, systemSummary } =
-      await identifyGame(
-        rulesText,
-        fileMeta.map((file) => file.name),
-      );
-
-    console.log("GAME IDENTIFIED:", {
-      systemName,
+    console.log("PDF extraction complete:", {
+      files: fileMeta.length,
+      pages: pages.length,
+      characters: rulesText.length,
     });
+
+    const {
+      systemName,
+      systemSummary,
+    } = await identifyGame(
+      rulesText,
+      fileMeta.map((file) => file.name),
+    );
+
+    console.log("Game identified:", {
+      systemName,
+      systemSummaryLength:
+        systemSummary.length,
+      rulesTextLength: rulesText.length,
+      pageCount: pages.length,
+      fileCount: fileMeta.length,
+    });
+
+    console.log(
+      "Attempting database insert...",
+    );
 
     const [game] = await db
       .insert(games)
       .values({
         title:
-          title === "Nova Campanha" && systemName
+          title === "Nova Campanha" &&
+          systemName
             ? systemName
             : title,
+
         masterProfile,
         rulesText,
         pages,
@@ -358,32 +395,129 @@ export async function POST(req: Request) {
       })
       .returning();
 
-    console.log("GAME CREATED:", {
-      id: game.id,
-      systemName: game.systemName,
-    });
+    console.log(
+      "Game successfully saved:",
+      {
+        id: game.id,
+        title: game.title,
+      },
+    );
 
     return Response.json({
       id: game.id,
       title: game.title,
-      masterProfile: game.masterProfile,
+      masterProfile:
+        game.masterProfile,
       files: game.files,
       rulesChars: rulesText.length,
       pageCount: pages.length,
       systemName: game.systemName,
-      systemSummary: game.systemSummary,
+      systemSummary:
+        game.systemSummary,
     });
   } catch (err) {
-    console.error("GAMES POST FAILED:", err);
+    /*
+     * IMPORTANTE:
+     *
+     * O Drizzle inclui todos os parâmetros
+     * da query na mensagem do erro.
+     *
+     * Como rulesText contém o livro inteiro,
+     * isso fazia o Vercel imprimir milhares
+     * de caracteres e cortar justamente a
+     * causa real do erro do PostgreSQL.
+     *
+     * Aqui removemos "params:" da mensagem
+     * principal e mostramos separadamente
+     * apenas a causa real.
+     */
+
+    const error =
+      err instanceof Error
+        ? err
+        : new Error(String(err));
+
+    const shortMessage =
+      error.message
+        .split("\nparams:")[0]
+        .slice(0, 5000);
+
+    let cause: unknown;
+
+    if ("cause" in error) {
+      cause = (
+        error as Error & {
+          cause?: unknown;
+        }
+      ).cause;
+    }
+
+    let causeInfo: unknown = cause;
+
+    if (cause instanceof Error) {
+      const postgresError =
+        cause as Error &
+          Record<string, unknown>;
+
+      causeInfo = {
+        name: cause.name,
+        message: cause.message,
+
+        code:
+          postgresError.code ?? null,
+
+        detail:
+          postgresError.detail ?? null,
+
+        hint:
+          postgresError.hint ?? null,
+
+        table:
+          postgresError.table ?? null,
+
+        column:
+          postgresError.column ?? null,
+
+        constraint:
+          postgresError.constraint ?? null,
+
+        schema:
+          postgresError.schema ?? null,
+      };
+    }
+
+    console.error(
+      "GAMES POST FAILED:",
+      {
+        name: error.name,
+        message: shortMessage,
+        cause: causeInfo,
+      },
+    );
 
     return Response.json(
       {
         error:
-          `Erro ao processar os arquivos: ${
-            err instanceof Error
-              ? err.message
-              : "erro desconhecido"
-          }`,
+          "Erro ao salvar o jogo no banco.",
+
+        detail:
+          cause instanceof Error
+            ? cause.message
+            : shortMessage,
+
+        code:
+          cause &&
+          typeof cause === "object" &&
+          "code" in cause
+            ? String(
+                (
+                  cause as Record<
+                    string,
+                    unknown
+                  >
+                ).code ?? "",
+              )
+            : undefined,
       },
       { status: 500 },
     );

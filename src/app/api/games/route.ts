@@ -2,7 +2,7 @@ import { db } from "@/db";
 import { games } from "@/db/schema";
 import { extractText, getDocumentProxy } from "unpdf";
 import { generateGemini, hasGemini } from "@/lib/gemini";
-import { get } from "@vercel/blob";
+import { get, list } from "@vercel/blob";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -20,7 +20,6 @@ function cleanText(s: string): string {
     .trim();
 }
 
-/** Ask the AI to identify which RPG system the rulebook belongs to. */
 async function identifyGame(
   rulesText: string,
   fileNames: string[],
@@ -65,6 +64,36 @@ ${sample}
   }
 }
 
+async function findRealBlob(pathname: string) {
+  console.log("Looking for Blob:", pathname);
+
+  // First try to find exactly what was uploaded under uploads/.
+  let cursor: string | undefined = undefined;
+
+  do {
+    const result = await list({
+      prefix: "uploads/",
+      limit: 1000,
+      cursor,
+    });
+
+    const exact = result.blobs.find(
+      (blob) => blob.pathname === pathname,
+    );
+
+    if (exact) {
+      console.log("Blob found:", exact.pathname);
+      return exact;
+    }
+
+    cursor = result.hasMore ? result.cursor : undefined;
+  } while (cursor);
+
+  console.error("Blob not found by list():", pathname);
+
+  return null;
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -75,32 +104,57 @@ export async function POST(req: Request) {
     const uploadedFiles: UploadedFile[] = Array.isArray(body.files)
       ? body.files
           .map((file: unknown) => {
-            if (!file || typeof file !== "object") return null;
+            if (!file || typeof file !== "object") {
+              return null;
+            }
 
             const item = file as Record<string, unknown>;
 
             const name =
-              typeof item.name === "string" ? item.name.trim() : "";
+              typeof item.name === "string"
+                ? item.name.trim()
+                : "";
 
             const pathname =
-              typeof item.pathname === "string" ? item.pathname.trim() : "";
+              typeof item.pathname === "string"
+                ? item.pathname.trim()
+                : "";
 
-            if (!name || !pathname) return null;
+            if (!name || !pathname) {
+              return null;
+            }
 
-            return { name, pathname };
+            return {
+              name,
+              pathname,
+            };
           })
-          .filter((file: UploadedFile | null): file is UploadedFile => file !== null)
+          .filter(
+            (file: UploadedFile | null): file is UploadedFile =>
+              file !== null,
+          )
       : [];
 
     if (uploadedFiles.length === 0) {
       return Response.json(
-        { error: "Nenhum PDF enviado foi informado." },
+        {
+          error: "Nenhum PDF enviado foi informado.",
+        },
         { status: 400 },
       );
     }
 
-    const fileMeta: { name: string; chars: number }[] = [];
-    const pages: { file: string; page: number; text: string }[] = [];
+    const fileMeta: {
+      name: string;
+      chars: number;
+    }[] = [];
+
+    const pages: {
+      file: string;
+      page: number;
+      text: string;
+    }[] = [];
+
     const chunks: string[] = [];
 
     for (const uploadedFile of uploadedFiles) {
@@ -108,36 +162,83 @@ export async function POST(req: Request) {
 
       if (!name.toLowerCase().endsWith(".pdf")) {
         return Response.json(
-          { error: `O arquivo "${name}" não é um PDF.` },
+          {
+            error: `O arquivo "${name}" não é um PDF.`,
+          },
           { status: 400 },
+        );
+      }
+
+      /*
+       * IMPORTANT:
+       * Confirm the Blob actually exists in the connected store.
+       */
+      const blob = await findRealBlob(uploadedFile.pathname);
+
+      if (!blob) {
+        return Response.json(
+          {
+            error:
+              `O PDF "${name}" foi enviado, mas não foi localizado pelo servidor. ` +
+              `Path recebido: ${uploadedFile.pathname}`,
+          },
+          { status: 404 },
         );
       }
 
       let buffer: Uint8Array;
 
       try {
-        const result = await get(uploadedFile.pathname, {
+        console.log("Reading Blob:", blob.pathname);
+
+        const result = await get(blob.pathname, {
           access: "private",
           useCache: false,
         });
 
         if (!result) {
+          console.error(
+            "get() returned null for existing Blob:",
+            blob.pathname,
+          );
+
           return Response.json(
-            { error: `O PDF "${name}" não foi encontrado no armazenamento.` },
-            { status: 404 },
+            {
+              error:
+                `O PDF "${name}" existe no armazenamento, ` +
+                `mas o servidor não conseguiu abrir o conteúdo.`,
+            },
+            { status: 422 },
           );
         }
 
-        const arrayBuffer = await new Response(result.stream).arrayBuffer();
+        const arrayBuffer = await new Response(
+          result.stream,
+        ).arrayBuffer();
+
         buffer = new Uint8Array(arrayBuffer);
+
+        console.log(
+          "Blob downloaded successfully:",
+          blob.pathname,
+          buffer.byteLength,
+          "bytes",
+        );
       } catch (err) {
-        console.error(`Blob read error for ${name}:`, err);
+        console.error(
+          `Blob read error for ${blob.pathname}:`,
+          err,
+        );
 
         return Response.json(
           {
-            error: `Não foi possível carregar o PDF "${name}" do armazenamento. ${
-              err instanceof Error ? err.message : ""
-            }`,
+            error:
+              `Não foi possível carregar o PDF "${name}" do armazenamento. ` +
+              `${
+                err instanceof Error
+                  ? err.message
+                  : "Erro desconhecido."
+              }`,
           },
           { status: 422 },
         );
@@ -147,19 +248,31 @@ export async function POST(req: Request) {
 
       try {
         const pdf = await getDocumentProxy(buffer);
-        const result = await extractText(pdf, { mergePages: false });
+
+        const result = await extractText(pdf, {
+          mergePages: false,
+        });
 
         pageTexts = (
-          Array.isArray(result.text) ? result.text : [result.text]
+          Array.isArray(result.text)
+            ? result.text
+            : [result.text]
         ).map(cleanText);
       } catch (err) {
-        console.error(`PDF parse error for ${name}:`, err);
+        console.error(
+          `PDF parse error for ${name}:`,
+          err,
+        );
 
         return Response.json(
           {
-            error: `Não foi possível ler o PDF "${name}". Ele pode estar protegido por senha ou corrompido. Detalhe: ${
-              err instanceof Error ? err.message : "erro desconhecido"
-            }`,
+            error:
+              `Não foi possível ler o PDF "${name}". ` +
+              `Ele pode estar protegido por senha ou corrompido. Detalhe: ${
+                err instanceof Error
+                  ? err.message
+                  : "erro desconhecido"
+              }`,
           },
           { status: 422 },
         );
@@ -189,7 +302,9 @@ export async function POST(req: Request) {
           `### Arquivo: ${name}\n` +
             pageTexts
               .map((text, index) =>
-                text ? `[p.${index + 1}]\n${text}` : "",
+                text
+                  ? `[p.${index + 1}]\n${text}`
+                  : "",
               )
               .filter(Boolean)
               .join("\n\n"),
@@ -205,16 +320,17 @@ export async function POST(req: Request) {
           error:
             "Nenhum texto pôde ser extraído dos PDFs enviados. " +
             "Provavelmente eles são digitalizados (imagens). " +
-            "Envie um PDF com texto selecionável (ex.: exportado direto do programa, não escaneado).",
+            "Envie um PDF com texto selecionável.",
         },
         { status: 422 },
       );
     }
 
-    const { systemName, systemSummary } = await identifyGame(
-      rulesText,
-      fileMeta.map((file) => file.name),
-    );
+    const { systemName, systemSummary } =
+      await identifyGame(
+        rulesText,
+        fileMeta.map((file) => file.name),
+      );
 
     const [game] = await db
       .insert(games)
@@ -248,7 +364,9 @@ export async function POST(req: Request) {
     return Response.json(
       {
         error: `Erro ao processar os arquivos: ${
-          err instanceof Error ? err.message : "erro desconhecido"
+          err instanceof Error
+            ? err.message
+            : "erro desconhecido"
         }`,
       },
       { status: 500 },
